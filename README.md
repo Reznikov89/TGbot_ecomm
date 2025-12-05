@@ -61,34 +61,7 @@ On first run, you'll need to:
 - **List Dialogs**: See your recent conversations
 - **Real-time Monitoring**: Listen for incoming messages
 
-## Project Structure
-```
-TGecomm/
-├── main.py              # Application entry point
-├── tgecomm/             # Main package
-│   ├── __init__.py      # Package initialization
-│   ├── main.py          # Main application logic
-│   ├── client.py        # Telegram client wrapper
-│   ├── config.py        # Configuration management
-│   ├── ui.py            # User interface
-│   ├── validators.py    # Input validation
-│   ├── logger.py        # Logging configuration
-│   ├── media_handler.py # Media processing utilities
-│   └── metrics.py       # Metrics and monitoring
-├── tests/               # Test suite
-│   ├── test_client.py
-│   ├── test_config.py
-│   ├── test_ui.py
-│   ├── test_validators.py
-│   └── test_logger.py
-├── docs/                # Documentation
-│   └── API.md           # API documentation
-├── requirements.txt      # Python dependencies
-├── pytest.ini           # Pytest configuration
-├── README.md            # This file
-├── .env                 # Environment variables (create from .env.example)
-└── .env.example         # Example environment configuration
-```
+
 
 ## Security Notes
 - Never commit your `.env` file or session files
