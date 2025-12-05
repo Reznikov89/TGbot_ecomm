@@ -1,7 +1,5 @@
-"""
-Telegram client module
-"""
 import asyncio
+import getpass
 from typing import Optional, List, Any
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -14,55 +12,65 @@ from telethon.errors import (
     NotFoundError
 )
 from telethon.tl.types import User, Chat, Channel, Message, Dialog
+
 from .config import Config
 from .logger import setup_logger
 from .media_handler import get_media_type, format_media_info
 from .metrics import get_metrics, TimingContext
+
 
 logger = setup_logger(__name__)
 metrics = get_metrics()
 
 
 class TGecommClient:
-    """Telegram client wrapper for TGecomm"""
+    """Telegram client wrapper for TGecomm with improved reliability"""
     
     def __init__(self) -> None:
         """Initialize the Telegram client"""
         Config.validate()
+        
+        if not all([Config.API_ID, Config.API_HASH, Config.PHONE]):
+            raise ValueError(
+                "Missing required configuration: API_ID, API_HASH, PHONE"
+            )
         
         self.client: TelegramClient = TelegramClient(
             Config.SESSION_NAME,
             Config.API_ID,
             Config.API_HASH
         )
-    
-    def _setup_handlers(self) -> None:
-        """Setup event handlers"""
         
-        @self.client.on(events.NewMessage(incoming=True))
-        async def handle_new_message(event: events.NewMessage.Event) -> None:
-            """Handle incoming messages"""
-            try:
-                sender = await event.get_sender()
-                chat = await event.get_chat()
-                
-                logger.info(f"New message received from {self._get_entity_name(sender)}")
-                print(f"\n[New Message]")
-                print(f"From: {self._get_entity_name(sender)}")
-                print(f"Chat: {self._get_entity_name(chat)}")
-                
-                # Handle messages with or without text
-                if event.message.text:
-                    message_text = event.message.text
-                elif event.message.media:
-                    message_text = format_media_info(event.message.media)
-                else:
-                    message_text = "[Empty message]"
-                
-                print(f"Message: {message_text}")
-            except Exception as e:
-                logger.error(f"Error handling new message: {e}", exc_info=True)
-                print(f"✗ Error handling new message: {e}")
+        # FIX: Флаг для предотвращения дублирования handlers
+        self._handlers_setup = False
+        self._send_lock = asyncio.Lock()
+        self._handlers_lock = asyncio.Lock()
+    
+    async def _setup_handlers(self) -> None:
+        """Setup event handlers (called once only) - thread-safe"""
+        
+        # Double-checked locking pattern для предотвращения race condition
+        if self._handlers_setup:
+            logger.debug("Handlers already setup, skipping")
+            return
+        
+        async with self._handlers_lock:
+            # Проверяем еще раз после получения блокировки
+            if self._handlers_setup:
+                logger.debug("Handlers already setup, skipping (double-check)")
+                return
+            
+            @self.client.on(events.NewMessage(incoming=True))
+            async def handle_new_message(event: events.NewMessage.Event) -> None:   
+                """Handle incoming messages"""
+                try:
+                    sender = await event.get_sender()
+                    chat = await event.get_chat()
+                except Exception as e:
+                    logger.error(f"Error handling new message: {e}", exc_info=True)
+            
+            self._handlers_setup = True
+            logger.debug("Handlers setup completed")
     
     @staticmethod
     def _get_entity_name(entity: Optional[Any]) -> str:
@@ -86,50 +94,40 @@ class TGecommClient:
             return entity.title or "Unknown Chat"
         return "Unknown"
     
-    async def __aenter__(self) -> 'TGecommClient':
-        """Async context manager entry"""
-        await self.start()
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
-        """Async context manager exit"""
-        await self.disconnect()
-    
-    async def start(self) -> None:
-        """Start the client
+    async def _batch_fetch_senders(self, messages: List[Message], batch_size: int = 5) -> List[Any]:
+        """Fetch senders in batches to avoid rate limiting
         
-        Raises:
-            SessionPasswordNeededError: If 2FA password is required
-            Exception: If connection fails
+        Args:
+            messages: List of message objects
+            batch_size: Number of messages per batch (default: 5)
+            
+        Returns:
+            List of sender objects (or exceptions)
         """
-        try:
-            await self.client.start(phone=Config.PHONE)
-            logger.info("Client started successfully")
-            print("✓ Client started successfully")
+        senders = []
+        total_batches = (len(messages) + batch_size - 1) // batch_size
+        
+        for i in range(0, len(messages), batch_size):
+            batch = messages[i:i + batch_size]
+            batch_num = (i // batch_size) + 1
             
-            me = await self.client.get_me()
-            username = f"@{me.username}" if me.username else "No username"
-            logger.info(f"Logged in as: {me.first_name} ({username})")
-            print(f"✓ Logged in as: {me.first_name} ({username})")
+            logger.debug(f"Fetching senders batch {batch_num}/{total_batches} ({len(batch)} messages)")
             
-            # Setup handlers after client is started
-            self._setup_handlers()
-        except SessionPasswordNeededError:
-            # Use asyncio.to_thread() to avoid blocking event loop
-            password = await asyncio.to_thread(input, "Enter your 2FA password: ")
-            await self.client.sign_in(password=password)
-            logger.info("2FA authentication successful")
-            print("✓ 2FA authentication successful")
+            batch_senders = await asyncio.gather(
+                *[msg.get_sender() for msg in batch],
+                return_exceptions=True
+            )
+            senders.extend(batch_senders)
             
-            # Setup handlers after 2FA authentication
-            self._setup_handlers()
-        except Exception as e:
-            logger.error(f"Error starting client: {e}", exc_info=True)
-            print(f"✗ Error starting client: {e}")
-            raise
+            # Небольшая задержка между батчами для предотвращения rate limiting
+            # (кроме последнего батча)
+            if i + batch_size < len(messages):
+                await asyncio.sleep(0.1)  # 100ms задержка между батчами
+        
+        return senders
     
     async def send_message(self, recipient: str, message: str) -> bool:
-        """Send a message to a recipient
+        """Send a message to a recipient (thread-safe)
         
         Args:
             recipient: Recipient identifier (username, phone, or chat_id)
@@ -152,8 +150,9 @@ class TGecommClient:
             return False
         
         try:
-            with TimingContext("send_message", {"recipient": recipient}):
-                await self.client.send_message(recipient, message)
+            async with self._send_lock:
+                with TimingContext("send_message", {"recipient": recipient}):
+                    await self.client.send_message(recipient, message)
             metrics.increment("messages_sent", tags={"recipient": recipient})
             logger.info(f"Message sent to {recipient}")
             print(f"✓ Message sent to {recipient}")
@@ -184,47 +183,6 @@ class TGecommClient:
             print(f"✗ Error sending message: {e}")
             return False
     
-    async def get_dialogs(self, limit: int = 10) -> List[Dialog]:
-        """Get list of dialogs (chats)
-        
-        Args:
-            limit: Maximum number of dialogs to retrieve (max 10000)
-            
-        Returns:
-            List of Dialog objects
-        """
-        if limit <= 0:
-            logger.warning(f"Invalid limit: {limit}")
-            print("✗ Error: Limit must be a positive number")
-            return []
-        
-        # Limit maximum to prevent memory issues
-        if limit > Config.MAX_DIALOGS_LIMIT:
-            logger.warning(f"Limit {limit} exceeds maximum {Config.MAX_DIALOGS_LIMIT}, using {Config.MAX_DIALOGS_LIMIT}")
-            limit = Config.MAX_DIALOGS_LIMIT
-        
-        try:
-            with TimingContext("get_dialogs", {"limit": str(limit)}):
-                dialogs = await self.client.get_dialogs(limit=limit)
-            
-            metrics.increment("dialogs_retrieved", value=len(dialogs) if dialogs else 0)
-            
-            if not dialogs:
-                logger.info("No dialogs found")
-                print("No dialogs found")
-                return []
-            
-            logger.info(f"Retrieved {len(dialogs)} dialogs")
-            print(f"\nYour dialogs (last {len(dialogs)}):")
-            for i, dialog in enumerate(dialogs, 1):
-                print(f"{i}. {dialog.name} (ID: {dialog.id})")
-            
-            return dialogs
-        except Exception as e:
-            logger.error(f"Error getting dialogs: {e}", exc_info=True)
-            print(f"✗ Error getting dialogs: {e}")
-            return []
-    
     async def get_messages(self, chat: str, limit: int = 10) -> List[Message]:
         """Get messages from a chat
         
@@ -254,9 +212,11 @@ class TGecommClient:
                     print(f"No messages found in {chat}")
                     return []
                 
-                # Batch fetch senders to improve performance
-                sender_tasks = [msg.get_sender() for msg in reversed(messages)]
-                senders = await asyncio.gather(*sender_tasks, return_exceptions=True)
+                # Batch fetch senders to avoid rate limiting
+                senders = await self._batch_fetch_senders(
+                    list(reversed(messages)),
+                    batch_size=5
+                )
             
             metrics.increment("messages_retrieved", value=len(messages), tags={"chat": chat})
             
@@ -298,23 +258,45 @@ class TGecommClient:
             print(f"✗ Error getting messages: {e}")
             return []
     
-    async def run(self) -> None:
-        """Run the client until disconnected"""
+    async def run(self, max_retries: int = 5) -> None:
+        """Run the client until disconnected with automatic reconnection
+        
+        Args:
+            max_retries: Maximum number of reconnection attempts (default: 5)
+        """
         logger.info("Client is now running and listening for messages")
         print("\n✓ TGecomm is running... (Press Ctrl+C to stop)")
-        try:
-            await self.client.run_until_disconnected()
-        except KeyboardInterrupt:
-            logger.info("Client interrupted by user")
-            raise
-    
-    async def disconnect(self) -> None:
-        """Disconnect the client"""
-        try:
-            if self.client.is_connected():
-                await self.client.disconnect()
-                logger.info("Client disconnected successfully")
-                print("✓ Client disconnected")
-        except Exception as e:
-            logger.error(f"Error disconnecting client: {e}", exc_info=True)
-            print(f"✗ Error disconnecting: {e}")
+        
+        for attempt in range(max_retries):
+            try:
+                await self.client.run_until_disconnected()
+                break
+            except KeyboardInterrupt:
+                logger.info("Client interrupted by user")
+                raise
+            except Exception as e:
+                logger.error(f"Connection lost: {e}", exc_info=True)
+                metrics.record_error("ConnectionError", str(e), {"attempt": attempt + 1})
+                
+                if attempt < max_retries - 1:
+                    wait_time = 5 * 60  # 5 минут в секундах
+                    logger.info(f"Attempting to reconnect in {wait_time // 60} minutes... (attempt {attempt + 1}/{max_retries})")
+                    print(f"⚠ Connection lost. Reconnecting in {wait_time // 60} minutes... (attempt {attempt + 1}/{max_retries})")
+                    await asyncio.sleep(wait_time)
+                    
+                    # Попытка переподключения
+                    try:
+                        if not self.client.is_connected():
+                            logger.info("Reconnecting to Telegram...")
+                            await self.client.connect()
+                            if not await self.client.is_user_authorized():
+                                await self.client.start(phone=Config.PHONE)
+                            logger.info("Reconnected successfully")
+                            print("✓ Reconnected successfully")
+                    except Exception as reconnect_error:
+                        logger.error(f"Reconnection failed: {reconnect_error}", exc_info=True)
+                        print(f"✗ Reconnection failed: {reconnect_error}")
+                else:
+                    logger.error(f"Max retries ({max_retries}) reached. Giving up.")
+                    print(f"✗ Max retries ({max_retries}) reached. Giving up.")
+                    raise
